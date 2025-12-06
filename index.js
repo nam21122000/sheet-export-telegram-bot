@@ -7,6 +7,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
 const pLimit = require('p-limit');
+const sharp = require('sharp');
 
 // === fetch PDF với retry chống 429 ===
 async function fetchPdfWithRetry(url, headers, attempt = 1) {
@@ -31,11 +32,20 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
 // Promise wrapper cho pdftoppm
 function convertPdfToPng(pdfPath, outPrefix) {
   return new Promise((resolve, reject) => {
-    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], (err) => {
+    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], async (err) => {
       if (err) return reject(err);
       const pngPath = outPrefix + '.png';
       if (!fs.existsSync(pngPath)) return reject(new Error('PNG conversion failed'));
-      resolve(pngPath);
+
+      try {
+        // Trim trắng tự động bằng sharp
+        const img = sharp(pngPath);
+        const trimmedBuffer = await img.trim().toBuffer();
+        await fs.promises.writeFile(pngPath, trimmedBuffer);
+        resolve(pngPath);
+      } catch (e) {
+        reject(e);
+      }
     });
   });
 }
