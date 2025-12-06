@@ -6,10 +6,10 @@ const { execFile } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const pLimit = require('p-limit'); // giới hạn song song
+const pLimit = require('p-limit');
 const sharp = require('sharp');
 
-// === chống Google 429: retry 5 lần ===
+// === Retry với exponential backoff ===
 async function fetchPdfWithRetry(url, headers, attempt = 1) {
   try {
     return await axios.get(url, {
@@ -20,7 +20,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      const delay = 1000 * attempt;
+      const delay = 1000 * Math.pow(2, attempt - 1); // 1s,2s,4s,8s
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
       return fetchPdfWithRetry(url, headers, attempt + 1);
@@ -29,16 +29,14 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
   }
 }
 
-// Promise wrapper cho pdftoppm
+// Promise wrapper cho pdftoppm + trim bằng sharp
 function convertPdfToPng(pdfPath, outPrefix) {
   return new Promise((resolve, reject) => {
     execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], async (err) => {
       if (err) return reject(err);
       const pngPath = outPrefix + '.png';
       if (!fs.existsSync(pngPath)) return reject(new Error('PNG conversion failed'));
-
       try {
-        // Trim trắng tự động bằng sharp
         const img = sharp(pngPath);
         const trimmedBuffer = await img.trim().toBuffer();
         await fs.promises.writeFile(pngPath, trimmedBuffer);
@@ -66,8 +64,6 @@ async function main() {
     }
 
     const creds = JSON.parse(serviceAccountJson);
-
-    // === Authorize ===
     const jwtClient = new google.auth.JWT(
       creds.client_email,
       null,
@@ -85,8 +81,8 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    // giới hạn số PDF → PNG song song
-    const limit = pLimit(2); // có thể tăng lên 2-4 tùy CPU
+    // Giới hạn song song convert PDF → PNG + upload Telegram
+    const limit = pLimit(2);
 
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
@@ -97,11 +93,8 @@ async function main() {
       if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
       const gid = sheetInfo.properties.sheetId;
 
-      // Lấy F5:K6
-      const rangeRes = await sheetsApi.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${sheetName}!F5:K6`
-      });
+      // Lấy F5:K6 để tạo caption
+      const rangeRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!F5:K6` });
       const values = rangeRes.data.values || [];
       const f5 = values[0]?.[0] || '';
       const j5 = values[0]?.[4] || '';
@@ -111,7 +104,7 @@ async function main() {
       const captionText = `${f5}    ${j5}    ${k5}`;
 
       // last row col K
-      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K200` });
+      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K2000` });
       const colVals = colRes.data.values || [];
       let lastRow = 1;
       for (let i = colVals.length - 1; i >= 0; i--) {
@@ -128,9 +121,9 @@ async function main() {
         startRow = endRow + 1;
       }
 
-      // --- convert PDF → PNG song song ---
+      // --- Export PDF → PNG serial để tránh 429 ---
       const albumImages = [];
-      const promises = chunks.map(chunk => limit(async () => {
+      for (const chunk of chunks) {
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
         const exportUrl =
           `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
@@ -139,23 +132,22 @@ async function main() {
 
         console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
         const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
+
         const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
+        // Delay nhỏ giữa các export PDF
+        await new Promise(r => setTimeout(r, 1500));
+
         const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
-        const pngPath = await convertPdfToPng(pdfPath, outPrefix);
+        const pngPath = await limit(() => convertPdfToPng(pdfPath, outPrefix));
 
-        // Delay nhẹ chống Telegram rate limit
-        await new Promise(r => setTimeout(r, 500));
+        albumImages.push({ path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow });
+      }
 
-        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
-      }));
-
-      const results = await Promise.all(promises);
-      // sắp xếp theo startRow để đảm bảo thứ tự
-      results.sort((a,b) => a.startRow - b.startRow);
-      albumImages.push(...results);
+      // --- sắp xếp album theo startRow ---
+      albumImages.sort((a,b)=>a.startRow - b.startRow);
 
       // --- SEND ALBUM ---
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
@@ -177,7 +169,11 @@ async function main() {
       console.log('📸 Album result:', tgResp.data);
 
       // cleanup album images (PDF + PNG)
-      albumImages.forEach(img=>{ try{ fs.unlinkSync(img.path); } catch{} });
+      albumImages.forEach(img=>{
+        try{ fs.unlinkSync(img.path); } catch{}
+        const pdfPath = path.join(tmpDir, img.fileName.replace('.png','.pdf'));
+        try{ fs.unlinkSync(pdfPath); } catch{}
+      });
     }
 
     // --- Cleanup tmpDir chung ---
