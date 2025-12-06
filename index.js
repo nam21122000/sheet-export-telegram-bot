@@ -29,25 +29,23 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
 
 // === Convert PDF → PNG + crop bằng pipeline không tạo file trung gian ===
 function convertPdfToPngOptimized(pdfPath, outputPngPath) {
-  return new Promise((resolve, reject) => {
+  const magickBin = getMagickBinary();
 
-    // pdftoppm -> stdout
+  return new Promise((resolve, reject) => {
     const pdftoppm = spawn('pdftoppm', [
       '-png',
       '-singlefile',
       '-r', '180',
       pdfPath,
-      '-'               // xuất ra stdout
+      '-'               
     ]);
 
-    // magick đọc stdin → crop → output file PNG
-    const magick = spawn('magick', [
-      '-',              // stdin
+    const magick = spawn(magickBin, [
+      '-',       
       '-trim',
-      outputPngPath     // output
+      outputPngPath    
     ]);
 
-    // nối pipeline
     pdftoppm.stdout.pipe(magick.stdin);
 
     let errLog = '';
@@ -55,7 +53,7 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.stderr.on('data', d => errLog += d.toString());
 
     magick.on('close', (code) => {
-      if (code !== 0) return reject(new Error('Magick error: ' + errLog));
+      if (code !== 0) return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
       resolve(outputPngPath);
     });
 
@@ -63,6 +61,7 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.on('error', reject);
   });
 }
+
 
 async function main() {
   try {
