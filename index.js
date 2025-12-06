@@ -27,6 +27,22 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
   }
 }
 
+function getMagickBinary() {
+  const candidates = process.platform === 'win32'
+    ? ['magick']                // Windows
+    : ['convert', 'magick'];    // Linux, GitHub Actions
+
+  for (const bin of candidates) {
+    try {
+      execFile(bin, ['-version']);
+      return bin;
+    } catch (_) {}
+  }
+
+  throw new Error('❌ No ImageMagick binary found');
+}
+
+
 // === Convert PDF → PNG + crop bằng pipeline không tạo file trung gian ===
 function convertPdfToPngOptimized(pdfPath, outputPngPath) {
   const magickBin = getMagickBinary();
