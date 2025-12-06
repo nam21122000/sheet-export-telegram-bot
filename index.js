@@ -48,19 +48,26 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
   const magickBin = getMagickBinary();
 
   return new Promise((resolve, reject) => {
+
+    //
+    // 1) pdftoppm xuất PPM → stdout
+    //
     const pdftoppm = spawn('pdftoppm', [
-      '-png',
       '-singlefile',
+      '-f', '1',
+      '-l', '1',
       '-r', '180',
       pdfPath,
-      '-'              // xuất PNG → stdout
+      '-'               // xuất ra stdout
     ]);
 
-    // ⚠ FIX: ép stdin là PNG bằng "PNG:-"
+    //
+    // 2) ImageMagick đọc từ stdin, trim, convert sang PNG
+    //
     const magick = spawn(magickBin, [
-      'PNG:-',         // <<< bắt ImageMagick decode đúng định dạng
+      'ppm:-',         // <<< Quan trọng: IM6 đọc PPM cực ổn
       '-trim',
-      outputPngPath
+      'png:' + outputPngPath
     ]);
 
     pdftoppm.stdout.pipe(magick.stdin);
@@ -70,7 +77,9 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.stderr.on('data', d => errLog += d.toString());
 
     magick.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
+      if (code !== 0) {
+        return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
+      }
       resolve(outputPngPath);
     });
 
@@ -78,7 +87,6 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.on('error', reject);
   });
 }
-
 
 
 async function main() {
