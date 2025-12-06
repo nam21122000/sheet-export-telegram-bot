@@ -20,7 +20,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      const delay = 1000 * attempt;
+      const delay = 2000 * attempt;
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
       return fetchPdfWithRetry(url, headers, attempt + 1);
@@ -86,8 +86,8 @@ async function main() {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
     // limit song song
-    const limit = pLimit(4); // tăng concurrency từ 2 -> 4
-
+    const limit = pLimit(2); 
+    
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
