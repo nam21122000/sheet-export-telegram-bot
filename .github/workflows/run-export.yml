@@ -18,6 +18,10 @@ jobs:
       - name: Install poppler-utils (pdftoppm)
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
 
+      # ===== Thêm bước cài ImageMagick =====
+      - name: Install ImageMagick
+        run: sudo apt-get install -y imagemagick
+
       - name: Install dependencies
         run: npm ci
 
