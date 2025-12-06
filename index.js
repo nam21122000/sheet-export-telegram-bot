@@ -18,7 +18,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      const delay = 2000 * attempt; // tăng: 2s, 4s, 6s, 8s
+      const delay = 2000 * attempt; // 2s,4s,6s,8s...
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
       return fetchPdfWithRetry(url, headers, attempt + 1);
@@ -40,12 +40,12 @@ async function main() {
     const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
     if (!serviceAccountJson || !SPREADSHEET_ID || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      throw new Error('Missing required environment variables. Please set GOOGLE_SERVICE_ACCOUNT_JSON, SPREADSHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID');
+      throw new Error('Missing required environment variables. Set GOOGLE_SERVICE_ACCOUNT_JSON, SPREADSHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID');
     }
 
     const creds = JSON.parse(serviceAccountJson);
 
-    // === Authorize as service account and get access token ===
+    // === Authorize ===
     const jwtClient = new google.auth.JWT(
       creds.client_email,
       null,
@@ -56,74 +56,77 @@ async function main() {
       ],
       null
     );
-
     await jwtClient.authorize();
     const tokenObj = await jwtClient.getAccessToken();
-    const accessToken = tokenObj && tokenObj.token;
-    if (!accessToken) throw new Error('Failed to obtain access token from service account');
+    const accessToken = tokenObj?.token;
+    if (!accessToken) throw new Error('Failed to obtain access token');
 
     const sheetsApi = google.sheets({ version: 'v4', auth: jwtClient });
 
-    // === PROCESS EACH SHEET ===
+    // === TẠO TMP DIR CHUNG ===
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
+
+    // === Process each sheet ===
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
-      // Get gid
+      // Get sheet info
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-      const sheetInfo = (meta.data.sheets || []).find(s => s.properties && s.properties.title === sheetName);
+      const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
       if (!sheetInfo) {
         console.log(`⚠️ Sheet "${sheetName}" not found — skipping`);
         continue;
       }
       const gid = sheetInfo.properties.sheetId;
 
-      // Find last non-empty row (column K)
+      // --- LẤY F5:J5, K5, K6 chỉ 1 request ---
+      const rangeRes = await sheetsApi.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${sheetName}!F5:K6`
+      });
+      const values = rangeRes.data.values || [];
+      const f5 = values[0]?.[0] || '';
+      const j5 = values[0]?.[4] || '';
+      const k5 = values[0]?.[5] || '';
+      const k6 = values[1]?.[5] || '';
+
+      if (!k6) {
+        console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`);
+        continue;
+      }
+
+      const captionText = `${f5}    ${j5}    ${k5}`;
+
+      // --- Find last row column K ---
       const colRes = await sheetsApi.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: `${sheetName}!K1:K2000`
       });
-
       const colVals = colRes.data.values || [];
       let lastRow = 1;
       for (let i = colVals.length - 1; i >= 0; i--) {
-        if (colVals[i] && colVals[i][0] !== '' && colVals[i][0] !== null) {
+        if (colVals[i]?.[0]) {
           lastRow = i + 1;
           break;
         }
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // Caption F5 J5 K5
-      const f5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!F5` })).data.values?.[0]?.[0] || '';
-      const j5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!J5` })).data.values?.[0]?.[0] || '';
-      const k5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K5` })).data.values?.[0]?.[0] || '';
-      const captionText = `${f5}    ${j5}    ${k5}`;
-
-      // Album images
+      // --- Xuất PDF → PNG và gom album ---
       let albumImages = [];
-
       let startRow = 1;
       while (startRow <= lastRow) {
         const endRow = Math.min(startRow + MAX_ROWS_PER_FILE - 1, lastRow);
-
         const rangeParam = `${sheetName}!${START_COL}${startRow}:${END_COL}${endRow}`;
         const exportUrl =
           `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
-          `&portrait=false&size=A4&fitw=true` +
-          `&sheetnames=false&printtitle=false&pagenumbers=false` +
-          `&gridlines=false&fzr=false` +
-          `&gid=${gid}` +
-          `&range=${encodeURIComponent(rangeParam)}`;
+          `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
+          `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
 
         console.log(`➡ Export PDF for ${sheetName} rows ${startRow}-${endRow}`);
-
-        // === USE RETRY HERE ===
-        const pdfResp = await fetchPdfWithRetry(exportUrl, {
-          Authorization: `Bearer ${accessToken}`
-        });
+        const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
 
         // Save PDF
-        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
         const pdfName = `${sheetName}_${startRow}-${endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
@@ -131,35 +134,21 @@ async function main() {
         // Convert PDF → PNG
         const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
         console.log('🔁 Converting PDF → PNG via pdftoppm');
-
-        try {
-          execFileSync('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], { stdio: 'inherit' });
-        } catch (err) {
-          console.error('❌ pdftoppm failed:', err.message);
-          throw err;
-        }
+        execFileSync('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath], { stdio: 'inherit' });
 
         const pngPath = outPrefix + '.png';
-        if (!fs.existsSync(pngPath)) {
-          console.log('❌ PNG not found:', fs.readdirSync(tmpDir));
-          throw new Error('PNG conversion failed');
-        }
+        if (!fs.existsSync(pngPath)) throw new Error('PNG conversion failed');
 
-        // Add to album
-        albumImages.push({
-          path: pngPath,
-          fileName: path.basename(pngPath)
-        });
+        albumImages.push({ path: pngPath, fileName: path.basename(pngPath) });
 
-        // delay nhẹ tránh spam Google
-        await new Promise(r => setTimeout(r, 1500));
+        // Delay nhẹ chống Telegram rate limit
+        await new Promise(r => setTimeout(r, 1000));
 
         startRow = endRow + 1;
       }
 
-      // === SEND ALBUM ===
+      // --- SEND ALBUM ---
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
-
       const formAlbum = new FormData();
       formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
 
@@ -168,32 +157,27 @@ async function main() {
         media: `attach://${img.fileName}`,
         caption: index === 0 ? captionText : undefined
       }));
-
       formAlbum.append('media', JSON.stringify(media));
-
-      // attach files
-      albumImages.forEach(img => {
-        formAlbum.append(img.fileName, fs.createReadStream(img.path));
-      });
+      albumImages.forEach(img => formAlbum.append(img.fileName, fs.createReadStream(img.path)));
 
       const tgResp = await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
         formAlbum,
         { headers: formAlbum.getHeaders() }
       );
-
       console.log('📸 Album result:', tgResp.data);
 
-      // cleanup
-      for (const img of albumImages) {
-        try { fs.unlinkSync(img.path); } catch {}
-      }
+      // Cleanup album images (PDF và PNG)
+      albumImages.forEach(img => { try { fs.unlinkSync(img.path); } catch {} });
       albumImages = [];
     }
 
+    // --- Cleanup tmpDir chung ---
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+
     console.log('🎉 All sheets processed successfully');
   } catch (err) {
-    console.error('ERROR:', err && err.message ? err.message : err);
+    console.error('ERROR:', err?.message || err);
     process.exit(1);
   }
 }
