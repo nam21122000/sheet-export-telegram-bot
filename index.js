@@ -50,22 +50,25 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
   return new Promise((resolve, reject) => {
 
     //
-    // 1) pdftoppm xuất PPM → stdout
+    // 1) pdftoppm xuất PPM chuẩn
     //
     const pdftoppm = spawn('pdftoppm', [
       '-singlefile',
       '-f', '1',
       '-l', '1',
       '-r', '180',
+      '-color',        // ép xuất PPM 24-bit
+      '-aa', 'yes',
       pdfPath,
-      '-'               // xuất ra stdout
+      '-'
     ]);
 
     //
-    // 2) ImageMagick đọc từ stdin, trim, convert sang PNG
+    // 2) ImageMagick đọc PPM từ stdin, trim và convert → PNG
     //
     const magick = spawn(magickBin, [
-      'ppm:-',         // <<< Quan trọng: IM6 đọc PPM cực ổn
+      'ppm:-',               // định dạng input chắc chắn là PPM
+      '-flatten',            // tránh lỗi PPM có alpha
       '-trim',
       'png:' + outputPngPath
     ]);
@@ -87,6 +90,7 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.on('error', reject);
   });
 }
+
 
 
 async function main() {
