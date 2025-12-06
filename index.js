@@ -6,9 +6,9 @@ const { execFile } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const pLimit = require('p-limit'); // giới hạn song song
+const pLimit = require('p-limit');
 
-// === chống Google 429: retry 5 lần ===
+// === fetch PDF với retry chống 429 ===
 async function fetchPdfWithRetry(url, headers, attempt = 1) {
   try {
     return await axios.get(url, {
@@ -57,7 +57,7 @@ async function main() {
 
     const creds = JSON.parse(serviceAccountJson);
 
-    // === Authorize ===
+    // === Authorize Google ===
     const jwtClient = new google.auth.JWT(
       creds.client_email,
       null,
@@ -75,13 +75,12 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    // giới hạn số PDF → PNG song song
-    const limit = pLimit(2); // có thể tăng lên 2-4 tùy CPU
+    // limit song song
+    const limit = pLimit(2);
 
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
-      // sheetInfo + gid
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
       const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
       if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
@@ -109,7 +108,7 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // --- build array chunks ---
+      // --- build chunks ---
       let chunks = [];
       let startRow = 1;
       while (startRow <= lastRow) {
@@ -136,14 +135,13 @@ async function main() {
         const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
         const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-        // Delay nhẹ chống Telegram rate limit
+        // delay nhẹ chống Telegram rate limit
         await new Promise(r => setTimeout(r, 1000));
 
-        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
+        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow, pdfPath };
       }));
 
       const results = await Promise.all(promises);
-      // sắp xếp theo startRow để đảm bảo thứ tự
       results.sort((a,b) => a.startRow - b.startRow);
       albumImages.push(...results);
 
@@ -166,8 +164,11 @@ async function main() {
       );
       console.log('📸 Album result:', tgResp.data);
 
-      // cleanup album images (PDF + PNG)
-      albumImages.forEach(img=>{ try{ fs.unlinkSync(img.path); } catch{} });
+      // --- CLEANUP: xóa PNG + PDF ---
+      albumImages.forEach(img=>{
+        try{ fs.unlinkSync(img.path); } catch{}
+        try{ fs.unlinkSync(img.pdfPath); } catch{}
+      });
     }
 
     // --- Cleanup tmpDir chung ---
