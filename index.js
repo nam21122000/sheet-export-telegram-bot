@@ -27,44 +27,6 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
   }
 }
 
-function getMagickBinary() {
-  const candidates = process.platform === 'win32'
-    ? ['magick']                
-    : ['convert', 'magick'];    
-
-  for (const bin of candidates) {
-    try {
-      execFile(bin, ['-version']);
-      return bin;
-    } catch (_) {}
-  }
-
-  throw new Error('❌ No ImageMagick binary found');
-}
-
-// === Convert PDF → PNG (không crop, không dùng pipeline) ===
-function convertPdfToPng(pdfPath, outputPngPath) {
-  const magickBin = getMagickBinary();
-
-  return new Promise((resolve, reject) => {
-    const convert = spawn(magickBin, [
-      pdfPath,
-      '-density', '180',    // độ phân giải
-      outputPngPath
-    ]);
-
-    let errLog = '';
-    convert.stderr.on('data', d => errLog += d.toString());
-
-    convert.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
-      resolve(outputPngPath);
-    });
-
-    convert.on('error', reject);
-  });
-}
-
 async function main() {
   try {
     const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
