@@ -48,49 +48,53 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
   const magickBin = getMagickBinary();
 
   return new Promise((resolve, reject) => {
+    const tmpPrefix = pdfPath.replace(/\.pdf$/i, '');   // /tmp/.../foo.pdf → /tmp/.../foo
 
-    //
-    // 1) pdftoppm xuất PPM chuẩn
-    //
+    // 1) Tạo file PPM
     const pdftoppm = spawn('pdftoppm', [
       '-singlefile',
       '-f', '1',
       '-l', '1',
       '-r', '180',
-      '-color',        // ép xuất PPM 24-bit
-      '-aa', 'yes',
+      '-color',
       pdfPath,
-      '-'
+      tmpPrefix
     ]);
-
-    //
-    // 2) ImageMagick đọc PPM từ stdin, trim và convert → PNG
-    //
-    const magick = spawn(magickBin, [
-      'ppm:-',               // định dạng input chắc chắn là PPM
-      '-flatten',            // tránh lỗi PPM có alpha
-      '-trim',
-      'png:' + outputPngPath
-    ]);
-
-    pdftoppm.stdout.pipe(magick.stdin);
 
     let errLog = '';
     pdftoppm.stderr.on('data', d => errLog += d.toString());
-    magick.stderr.on('data', d => errLog += d.toString());
-
-    magick.on('close', (code) => {
-      if (code !== 0) {
-        return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
-      }
-      resolve(outputPngPath);
-    });
-
     pdftoppm.on('error', reject);
-    magick.on('error', reject);
+
+    pdftoppm.on('close', (code) => {
+      if (code !== 0) {
+        return reject(new Error(`pdftoppm error: ${errLog}`));
+      }
+
+      const ppmFile = tmpPrefix + '.ppm';
+
+      // 2) convert PPM → PNG
+      const magick = spawn(magickBin, [
+        ppmFile,
+        '-trim',
+        outputPngPath
+      ]);
+
+      let err2 = '';
+      magick.stderr.on('data', d => err2 += d.toString());
+      magick.on('error', reject);
+
+      magick.on('close', (code2) => {
+        // cleanup PPM
+        try { fs.unlinkSync(ppmFile); } catch {}
+
+        if (code2 !== 0) {
+          return reject(new Error(`ImageMagick error: ${err2}`));
+        }
+        resolve(outputPngPath);
+      });
+    });
   });
 }
-
 
 
 async function main() {
