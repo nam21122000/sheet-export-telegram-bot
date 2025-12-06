@@ -7,6 +7,26 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
 
+// === chống Google 429: retry 5 lần ===
+async function fetchPdfWithRetry(url, headers, attempt = 1) {
+  try {
+    return await axios.get(url, {
+      responseType: 'arraybuffer',
+      headers,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
+    });
+  } catch (err) {
+    if (err.response && err.response.status === 429 && attempt < 5) {
+      const delay = 2000 * attempt; // tăng: 2s, 4s, 6s, 8s
+      console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
+      await new Promise(r => setTimeout(r, delay));
+      return fetchPdfWithRetry(url, headers, attempt + 1);
+    }
+    throw err;
+  }
+}
+
 async function main() {
   try {
     // === Env / Config ===
@@ -44,11 +64,11 @@ async function main() {
 
     const sheetsApi = google.sheets({ version: 'v4', auth: jwtClient });
 
-    // === START PROCESS EACH SHEET ===
+    // === PROCESS EACH SHEET ===
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
-      // Get sheet metadata to find gid
+      // Get gid
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
       const sheetInfo = (meta.data.sheets || []).find(s => s.properties && s.properties.title === sheetName);
       if (!sheetInfo) {
@@ -57,10 +77,12 @@ async function main() {
       }
       const gid = sheetInfo.properties.sheetId;
 
-      // find lastRow by reading column K (col 11)
-      const colToCheck = 'K';
-      const colRange = `${sheetName}!${colToCheck}1:${colToCheck}2000`;
-      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: colRange });
+      // Find last non-empty row (column K)
+      const colRes = await sheetsApi.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${sheetName}!K1:K2000`
+      });
+
       const colVals = colRes.data.values || [];
       let lastRow = 1;
       for (let i = colVals.length - 1; i >= 0; i--) {
@@ -71,13 +93,13 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // Get caption parts F5, J5, K5
+      // Caption F5 J5 K5
       const f5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!F5` })).data.values?.[0]?.[0] || '';
       const j5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!J5` })).data.values?.[0]?.[0] || '';
       const k5 = (await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K5` })).data.values?.[0]?.[0] || '';
       const captionText = `${f5}    ${j5}    ${k5}`;
 
-      // --- NEW: store PNGs for album ---
+      // Album images
       let albumImages = [];
 
       let startRow = 1;
@@ -94,22 +116,21 @@ async function main() {
           `&range=${encodeURIComponent(rangeParam)}`;
 
         console.log(`➡ Export PDF for ${sheetName} rows ${startRow}-${endRow}`);
-        const pdfResp = await axios.get(exportUrl, {
-          responseType: 'arraybuffer',
-          headers: { Authorization: `Bearer ${accessToken}` },
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity
+
+        // === USE RETRY HERE ===
+        const pdfResp = await fetchPdfWithRetry(exportUrl, {
+          Authorization: `Bearer ${accessToken}`
         });
 
-        // Save PDF to temp file
+        // Save PDF
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
         const pdfName = `${sheetName}_${startRow}-${endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
-        // Convert PDF -> PNG
+        // Convert PDF → PNG
         const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
-        console.log('🔁 Converting PDF -> PNG via pdftoppm');
+        console.log('🔁 Converting PDF → PNG via pdftoppm');
 
         try {
           execFileSync('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], { stdio: 'inherit' });
@@ -120,29 +141,28 @@ async function main() {
 
         const pngPath = outPrefix + '.png';
         if (!fs.existsSync(pngPath)) {
-          console.log('❌ PNG not found after conversion. Listing tmpDir:', fs.readdirSync(tmpDir));
+          console.log('❌ PNG not found:', fs.readdirSync(tmpDir));
           throw new Error('PNG conversion failed');
         }
 
-        // PUSH PNG to album list instead of sending immediately
+        // Add to album
         albumImages.push({
           path: pngPath,
           fileName: path.basename(pngPath)
         });
 
-        // Anti-rate limit delay
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        // delay nhẹ tránh spam Google
+        await new Promise(r => setTimeout(r, 1500));
 
         startRow = endRow + 1;
-      } // end while chunks
+      }
 
-      // === NEW: SEND MEDIA GROUP (ALBUM FOR THE WHOLE SHEET) ===
+      // === SEND ALBUM ===
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
 
       const formAlbum = new FormData();
       formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
 
-      // Create media metadata
       const media = albumImages.map((img, index) => ({
         type: "photo",
         media: `attach://${img.fileName}`,
@@ -151,27 +171,25 @@ async function main() {
 
       formAlbum.append('media', JSON.stringify(media));
 
-      // Attach files
+      // attach files
       albumImages.forEach(img => {
         formAlbum.append(img.fileName, fs.createReadStream(img.path));
       });
 
-      const tgAlbumUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`;
-      const tgRespAlbum = await axios.post(tgAlbumUrl, formAlbum, {
-        headers: formAlbum.getHeaders(),
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity
-      });
+      const tgResp = await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
+        formAlbum,
+        { headers: formAlbum.getHeaders() }
+      );
 
-      console.log('📸 Album result:', JSON.stringify(tgRespAlbum.data, null, 2));
+      console.log('📸 Album result:', tgResp.data);
 
-      // Cleanup temp png files
+      // cleanup
       for (const img of albumImages) {
         try { fs.unlinkSync(img.path); } catch {}
       }
-
       albumImages = [];
-    } // end for each sheet
+    }
 
     console.log('🎉 All sheets processed successfully');
   } catch (err) {
