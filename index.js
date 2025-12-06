@@ -53,13 +53,14 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
       '-singlefile',
       '-r', '180',
       pdfPath,
-      '-'               
+      '-'              // xuất PNG → stdout
     ]);
 
+    // ⚠ FIX: ép stdin là PNG bằng "PNG:-"
     const magick = spawn(magickBin, [
-      '-',       
+      'PNG:-',         // <<< bắt ImageMagick decode đúng định dạng
       '-trim',
-      outputPngPath    
+      outputPngPath
     ]);
 
     pdftoppm.stdout.pipe(magick.stdin);
@@ -77,6 +78,7 @@ function convertPdfToPngOptimized(pdfPath, outputPngPath) {
     magick.on('error', reject);
   });
 }
+
 
 
 async function main() {
