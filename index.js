@@ -31,11 +31,18 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
 // Promise wrapper cho pdftoppm
 function convertPdfToPng(pdfPath, outPrefix) {
   return new Promise((resolve, reject) => {
-    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], (err) => {
+    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], async (err) => {
       if (err) return reject(err);
       const pngPath = outPrefix + '.png';
       if (!fs.existsSync(pngPath)) return reject(new Error('PNG conversion failed'));
-      resolve(pngPath);
+
+      // === crop tự động bằng ImageMagick ===
+      const croppedPath = outPrefix + '_crop.png';
+      execFile('magick', [pngPath, '-trim', croppedPath], (err2) => {
+        if (err2) return reject(err2);
+        if (!fs.existsSync(croppedPath)) return reject(new Error('Image crop failed'));
+        resolve(croppedPath);
+      });
     });
   });
 }
@@ -118,7 +125,7 @@ async function main() {
         startRow = endRow + 1;
       }
 
-      // --- convert PDF → PNG song song ---
+      // --- convert PDF → PNG song song với crop ---
       const albumImages = [];
       const promises = chunks.map(chunk => limit(async () => {
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
