@@ -85,7 +85,7 @@ async function main() {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
     // giới hạn số PDF → PNG song song
-    const limit = pLimit(2); // song song 2 chunk
+    const limit = pLimit(1);
 
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
