@@ -1,11 +1,12 @@
+// index.js
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, execFile } = require('child_process');
+const { execFile } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const pLimit = require('p-limit');
+const pLimit = require('p-limit'); // giới hạn song song
 
 // === chống Google 429: retry 5 lần ===
 async function fetchPdfWithRetry(url, headers, attempt = 1) {
@@ -25,6 +26,18 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     }
     throw err;
   }
+}
+
+// Promise wrapper cho pdftoppm
+function convertPdfToPng(pdfPath, outPrefix) {
+  return new Promise((resolve, reject) => {
+    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], (err) => {
+      if (err) return reject(err);
+      const pngPath = outPrefix + '.png';
+      if (!fs.existsSync(pngPath)) return reject(new Error('PNG conversion failed'));
+      resolve(pngPath);
+    });
+  });
 }
 
 async function main() {
@@ -62,20 +75,19 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    // giới hạn số PDF xử lý song song
-    const limit = pLimit(2);
+    // giới hạn số PDF → PNG song song
+    const limit = pLimit(2); // có thể tăng lên 2-4 tùy CPU
 
-    // ==========================
-    //      PROCESS EACH SHEET
-    // ==========================
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
+      // sheetInfo + gid
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
       const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
       if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
       const gid = sheetInfo.properties.sheetId;
 
+      // Lấy F5:K6
       const rangeRes = await sheetsApi.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: `${sheetName}!F5:K6`
@@ -88,6 +100,7 @@ async function main() {
       if (!k6) { console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`); continue; }
       const captionText = `${f5}    ${j5}    ${k5}`;
 
+      // last row col K
       const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K2000` });
       const colVals = colRes.data.values || [];
       let lastRow = 1;
@@ -96,6 +109,7 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
+      // --- build array chunks ---
       let chunks = [];
       let startRow = 1;
       while (startRow <= lastRow) {
@@ -104,50 +118,46 @@ async function main() {
         startRow = endRow + 1;
       }
 
+      // --- convert PDF → PNG song song ---
       const albumImages = [];
       const promises = chunks.map(chunk => limit(async () => {
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
-
         const exportUrl =
           `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
           `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
           `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
 
         console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
-
         const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
-
         const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
-        const finalPngPath = path.join(tmpDir, `${sheetName}_${chunk.startRow}-${chunk.endRow}.png`);
-        await convertPdfToPng(pdfPath, finalPngPath);
+        const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
+        const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-        return {
-          path: finalPngPath,
-          fileName: path.basename(finalPngPath),
-          startRow: chunk.startRow
-        };
+        // Delay nhẹ chống Telegram rate limit
+        await new Promise(r => setTimeout(r, 1000));
+
+        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
       }));
 
       const results = await Promise.all(promises);
-      results.sort((a, b) => a.startRow - b.startRow);
+      // sắp xếp theo startRow để đảm bảo thứ tự
+      results.sort((a,b) => a.startRow - b.startRow);
       albumImages.push(...results);
 
+      // --- SEND ALBUM ---
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
-
       const formAlbum = new FormData();
       formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
-
-      const media = albumImages.map((img, index) => ({
-        type: "photo",
-        media: `attach://${img.fileName}`,
-        caption: index === 0 ? captionText : undefined
+      const media = albumImages.map((img,index)=>({
+        type:"photo",
+        media:`attach://${img.fileName}`,
+        caption:index===0?captionText:undefined
       }));
       formAlbum.append('media', JSON.stringify(media));
-
-      albumImages.forEach(img => formAlbum.append(img.fileName, fs.createReadStream(img.path)));
+      albumImages.forEach(img=>formAlbum.append(img.fileName, fs.createReadStream(img.path)));
 
       const tgResp = await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
@@ -156,15 +166,15 @@ async function main() {
       );
       console.log('📸 Album result:', tgResp.data);
 
-      albumImages.forEach(img => {
-        try { fs.unlinkSync(img.path); } catch {}
-      });
+      // cleanup album images (PDF + PNG)
+      albumImages.forEach(img=>{ try{ fs.unlinkSync(img.path); } catch{} });
     }
 
+    // --- Cleanup tmpDir chung ---
     fs.rmSync(tmpDir, { recursive: true, force: true });
     console.log('🎉 All sheets processed successfully');
 
-  } catch (err) {
+  } catch(err) {
     console.error('ERROR:', err?.message || err);
     process.exit(1);
   }
