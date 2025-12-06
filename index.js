@@ -29,8 +29,8 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
 
 function getMagickBinary() {
   const candidates = process.platform === 'win32'
-    ? ['magick']                // Windows
-    : ['convert', 'magick'];    // Linux, GitHub Actions
+    ? ['magick']                
+    : ['convert', 'magick'];    
 
   for (const bin of candidates) {
     try {
@@ -42,60 +42,28 @@ function getMagickBinary() {
   throw new Error('❌ No ImageMagick binary found');
 }
 
-
-// === Convert PDF → PNG + crop bằng pipeline không tạo file trung gian ===
-function convertPdfToPngOptimized(pdfPath, outputPngPath) {
+// === Convert PDF → PNG (không crop, không dùng pipeline) ===
+function convertPdfToPng(pdfPath, outputPngPath) {
   const magickBin = getMagickBinary();
 
   return new Promise((resolve, reject) => {
-    const tmpPrefix = pdfPath.replace(/\.pdf$/i, '');   // /tmp/.../foo.pdf → /tmp/.../foo
-
-    // 1) Tạo file PPM
-    const pdftoppm = spawn('pdftoppm', [
-      '-singlefile',
-      '-f', '1',
-      '-l', '1',
-      '-r', '180',
-      '-color',
+    const convert = spawn(magickBin, [
       pdfPath,
-      tmpPrefix
+      '-density', '180',    // độ phân giải
+      outputPngPath
     ]);
 
     let errLog = '';
-    pdftoppm.stderr.on('data', d => errLog += d.toString());
-    pdftoppm.on('error', reject);
+    convert.stderr.on('data', d => errLog += d.toString());
 
-    pdftoppm.on('close', (code) => {
-      if (code !== 0) {
-        return reject(new Error(`pdftoppm error: ${errLog}`));
-      }
-
-      const ppmFile = tmpPrefix + '.ppm';
-
-      // 2) convert PPM → PNG
-      const magick = spawn(magickBin, [
-        ppmFile,
-        '-trim',
-        outputPngPath
-      ]);
-
-      let err2 = '';
-      magick.stderr.on('data', d => err2 += d.toString());
-      magick.on('error', reject);
-
-      magick.on('close', (code2) => {
-        // cleanup PPM
-        try { fs.unlinkSync(ppmFile); } catch {}
-
-        if (code2 !== 0) {
-          return reject(new Error(`ImageMagick error: ${err2}`));
-        }
-        resolve(outputPngPath);
-      });
+    convert.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`ImageMagick error (${magickBin}): ${errLog}`));
+      resolve(outputPngPath);
     });
+
+    convert.on('error', reject);
   });
 }
-
 
 async function main() {
   try {
@@ -141,13 +109,11 @@ async function main() {
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
-      // sheetInfo + gid
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
       const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
       if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
       const gid = sheetInfo.properties.sheetId;
 
-      // Lấy F5:K6
       const rangeRes = await sheetsApi.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: `${sheetName}!F5:K6`
@@ -160,7 +126,6 @@ async function main() {
       if (!k6) { console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`); continue; }
       const captionText = `${f5}    ${j5}    ${k5}`;
 
-      // last row col K
       const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K2000` });
       const colVals = colRes.data.values || [];
       let lastRow = 1;
@@ -169,7 +134,6 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // --- build chunks ---
       let chunks = [];
       let startRow = 1;
       while (startRow <= lastRow) {
@@ -178,12 +142,8 @@ async function main() {
         startRow = endRow + 1;
       }
 
-      // ==========================
-      //     CONVERT PDF → PNG
-      // ==========================
       const albumImages = [];
       const promises = chunks.map(chunk => limit(async () => {
-
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
 
         const exportUrl =
@@ -193,16 +153,14 @@ async function main() {
 
         console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
 
-        // Download PDF
         const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
 
         const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
-        // Convert + crop trong 1 bước, không file trung gian
         const finalPngPath = path.join(tmpDir, `${sheetName}_${chunk.startRow}-${chunk.endRow}.png`);
-        await convertPdfToPngOptimized(pdfPath, finalPngPath);
+        await convertPdfToPng(pdfPath, finalPngPath);
 
         return {
           path: finalPngPath,
@@ -212,14 +170,9 @@ async function main() {
       }));
 
       const results = await Promise.all(promises);
-
-      // sắp xếp bảo toàn thứ tự
       results.sort((a, b) => a.startRow - b.startRow);
       albumImages.push(...results);
 
-      // ================
-      //  SEND ALBUM
-      // ================
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
 
       const formAlbum = new FormData();
@@ -241,13 +194,11 @@ async function main() {
       );
       console.log('📸 Album result:', tgResp.data);
 
-      // cleanup PNG
       albumImages.forEach(img => {
         try { fs.unlinkSync(img.path); } catch {}
       });
     }
 
-    // cleanup tmpDir
     fs.rmSync(tmpDir, { recursive: true, force: true });
     console.log('🎉 All sheets processed successfully');
 
