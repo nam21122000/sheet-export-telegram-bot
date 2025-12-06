@@ -6,10 +6,10 @@ const { execFile } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const pLimit = require('p-limit');
+const pLimit = require('p-limit'); // giới hạn song song
 const sharp = require('sharp');
 
-// === fetch PDF với retry chống 429 ===
+// === chống Google 429: retry 5 lần ===
 async function fetchPdfWithRetry(url, headers, attempt = 1) {
   try {
     return await axios.get(url, {
@@ -20,7 +20,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      const delay = 2000 * attempt;
+      const delay = 1000 * attempt;
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
       return fetchPdfWithRetry(url, headers, attempt + 1);
@@ -67,7 +67,7 @@ async function main() {
 
     const creds = JSON.parse(serviceAccountJson);
 
-    // === Authorize Google ===
+    // === Authorize ===
     const jwtClient = new google.auth.JWT(
       creds.client_email,
       null,
@@ -85,12 +85,13 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    // limit song song
-    const limit = pLimit(2); 
-    
+    // giới hạn số PDF → PNG song song
+    const limit = pLimit(2); // có thể tăng lên 2-4 tùy CPU
+
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
+      // sheetInfo + gid
       const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
       const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
       if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
@@ -110,7 +111,7 @@ async function main() {
       const captionText = `${f5}    ${j5}    ${k5}`;
 
       // last row col K
-      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K2000` });
+      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K200` });
       const colVals = colRes.data.values || [];
       let lastRow = 1;
       for (let i = colVals.length - 1; i >= 0; i--) {
@@ -118,7 +119,7 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // --- build chunks ---
+      // --- build array chunks ---
       let chunks = [];
       let startRow = 1;
       while (startRow <= lastRow) {
@@ -127,42 +128,46 @@ async function main() {
         startRow = endRow + 1;
       }
 
-      // --- 1. Export PDF song song ---
-      const pdfResults = await Promise.all(chunks.map(chunk => limit(async () => {
+      // --- convert PDF → PNG song song ---
+      const albumImages = [];
+      const promises = chunks.map(chunk => limit(async () => {
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
         const exportUrl =
           `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
           `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
           `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
+
         console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
         const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
-        const pdfPath = path.join(tmpDir, `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`);
+        const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
+        const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
-        return { pdfPath, startRow: chunk.startRow };
-      })));
 
-      pdfResults.sort((a,b) => a.startRow - b.startRow);
+        const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
+        const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-      // --- 2. Convert PDF → PNG song song ---
-      const pngResults = await Promise.all(pdfResults.map(r => limit(async () => {
-        const outPrefix = r.pdfPath.replace('.pdf','');
-        const pngPath = await convertPdfToPng(r.pdfPath, outPrefix);
-        return { pngPath, fileName: path.basename(pngPath), startRow: r.startRow, pdfPath: r.pdfPath };
-      })));
+        // Delay nhẹ chống Telegram rate limit
+        await new Promise(r => setTimeout(r, 500));
 
-      pngResults.sort((a,b) => a.startRow - b.startRow);
+        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
+      }));
 
-      // --- 3. Gửi album Telegram ---
-      console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${pngResults.length} images`);
+      const results = await Promise.all(promises);
+      // sắp xếp theo startRow để đảm bảo thứ tự
+      results.sort((a,b) => a.startRow - b.startRow);
+      albumImages.push(...results);
+
+      // --- SEND ALBUM ---
+      console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
       const formAlbum = new FormData();
       formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
-      const media = pngResults.map((img,index)=>({
+      const media = albumImages.map((img,index)=>({
         type:"photo",
         media:`attach://${img.fileName}`,
         caption:index===0?captionText:undefined
       }));
       formAlbum.append('media', JSON.stringify(media));
-      pngResults.forEach(img=>formAlbum.append(img.fileName, fs.createReadStream(img.pngPath)));
+      albumImages.forEach(img=>formAlbum.append(img.fileName, fs.createReadStream(img.path)));
 
       const tgResp = await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
@@ -171,11 +176,8 @@ async function main() {
       );
       console.log('📸 Album result:', tgResp.data);
 
-      // --- 4. Cleanup PNG + PDF ---
-      pngResults.forEach(img=>{
-        try{ fs.unlinkSync(img.pngPath); } catch{}
-        try{ fs.unlinkSync(img.pdfPath); } catch{}
-      });
+      // cleanup album images (PDF + PNG)
+      albumImages.forEach(img=>{ try{ fs.unlinkSync(img.path); } catch{} });
     }
 
     // --- Cleanup tmpDir chung ---
