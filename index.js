@@ -6,7 +6,6 @@ const { execFile } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const pLimit = require('p-limit');
 const sharp = require('sharp');
 
 // === chống Google 429: retry 5 lần ===
@@ -84,9 +83,6 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    // giới hạn số PDF → PNG song song
-    const limit = pLimit(1);
-
     for (const sheetName of SHEET_NAMES) {
       console.log('--- Processing sheet:', sheetName);
 
@@ -140,33 +136,35 @@ async function main() {
 
       // --- convert PDF → PNG song song với pLimit + delay chunk nhỏ ---
       const albumImages = [];
-      const promises = chunks.map(chunk => limit(async () => {
-        const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
-        const exportUrl =
-          `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
-          `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
-          `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
 
-        console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
-        const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
+for (const chunk of chunks) {
+  const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
+  const exportUrl =
+    `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
+    `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
+    `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
 
-        const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
-        const pdfPath = path.join(tmpDir, pdfName);
-        fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
+  console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
+  const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
 
-        const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
-        const pngPath = await convertPdfToPng(pdfPath, outPrefix);
+  const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
+  const pdfPath = path.join(tmpDir, pdfName);
+  fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
-        // --- delay tăng dần cho chunk nhỏ để giảm 429 ---
-        const chunkSize = chunk.endRow - chunk.startRow + 1;
-        if (chunkSize < MAX_ROWS_PER_FILE) {
-          const extraDelay = 500 + (MAX_ROWS_PER_FILE - chunkSize) * 100;
-          console.log(`⏱ Delay thêm ${extraDelay}ms cho chunk nhỏ (${chunkSize} row)`);
-          await new Promise(r => setTimeout(r, extraDelay));
-        }
+  const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
+  const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-        return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
-      }));
+  // delay cho chunk nhỏ
+  const chunkSize = chunk.endRow - chunk.startRow + 1;
+  if (chunkSize < MAX_ROWS_PER_FILE) {
+    const extraDelay = 500 + (MAX_ROWS_PER_FILE - chunkSize) * 100;
+    console.log(`⏱ Delay thêm ${extraDelay}ms cho chunk nhỏ (${chunkSize} row)`);
+    await new Promise(r => setTimeout(r, extraDelay));
+  }
+
+  albumImages.push({ path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow });
+}
+
 
       const results = await Promise.all(promises);
       results.sort((a,b) => a.startRow - b.startRow);
