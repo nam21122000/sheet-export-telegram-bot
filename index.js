@@ -19,7 +19,8 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      const delay = 2000 * attempt;
+      // delay random 1–3s
+      const delay = 1000 + Math.floor(Math.random() * 2000);
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
       return fetchPdfWithRetry(url, headers, attempt + 1);
@@ -138,6 +139,11 @@ async function main() {
       const albumImages = [];
 
 for (const chunk of chunks) {
+   // --- delay trước khi request PDF ---
+  const preDelay = 500 + Math.floor(Math.random() * 1000); // 0.5 – 1.5s
+  console.log(`⏱ Pre-delay ${preDelay}ms before fetching PDF for rows ${chunk.startRow}-${chunk.endRow}`);
+  await new Promise(r => setTimeout(r, preDelay));
+  
   const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
   const exportUrl =
     `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
@@ -165,10 +171,6 @@ for (const chunk of chunks) {
   albumImages.push({ path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow });
 }
 
-
-      //const results = await Promise.all(promises);
-      //results.sort((a,b) => a.startRow - b.startRow);
-      //albumImages.push(...results);
 
       // --- SEND ALBUM ---
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
