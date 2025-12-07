@@ -84,56 +84,74 @@ async function main() {
     // === tmpDir chung ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    for (const sheetName of SHEET_NAMES) {
-      console.log('--- Processing sheet:', sheetName);
+    const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+    const allSheets = meta.data.sheets || [];
 
-      // sheetInfo + gid
-      const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-      const sheetInfo = (meta.data.sheets || []).find(s => s.properties?.title === sheetName);
-      if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
-      const gid = sheetInfo.properties.sheetId;
+for (const sheetName of SHEET_NAMES) {
+  console.log('--- Processing sheet:', sheetName);
 
-      // Lấy F5:K6
-      const rangeRes = await sheetsApi.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${sheetName}!F5:K6`
-      });
-      const values = rangeRes.data.values || [];
-      const f5 = values[0]?.[0] || '';
-      const j5 = values[0]?.[4] || '';
-      const k5 = values[0]?.[5] || '';
-      const k6 = values[1]?.[5] || '';
-      if (!k6) { console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`); continue; }
-      const captionText = `${f5}    ${j5}    ${k5}`;
+  // === lấy sheetInfo từ allSheets (không gọi API lại) ===
+  const sheetInfo = allSheets.find(s => s.properties?.title === sheetName);
+  if (!sheetInfo) {
+    console.log(`⚠️ Sheet "${sheetName}" not found — skipping`);
+    continue;
+  }
+  const gid = sheetInfo.properties.sheetId;
 
-      // last row col K
-      const colRes = await sheetsApi.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${sheetName}!K1:K2000` });
-      const colVals = colRes.data.values || [];
-      let lastRow = 1;
-      for (let i = colVals.length - 1; i >= 0; i--) {
-        if (colVals[i]?.[0]) { lastRow = i + 1; break; }
-      }
-      console.log('Last row detected (col K):', lastRow);
+  // === Lấy F5:K6 ===
+  const rangeRes = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${sheetName}!F5:K6`
+  });
 
-      // --- build array chunks + gộp chunk cuối nhỏ ---
-      let chunks = [];
-      let startRow = 1;
-      while (startRow <= lastRow) {
-        const endRow = Math.min(startRow + MAX_ROWS_PER_FILE - 1, lastRow);
-        chunks.push({ startRow, endRow });
-        startRow = endRow + 1;
-      }
+  const values = rangeRes.data.values || [];
+  const f5 = values[0]?.[0] || '';
+  const j5 = values[0]?.[4] || '';
+  const k5 = values[0]?.[5] || '';
+  const k6 = values[1]?.[5] || '';
 
-      // gộp chunk cuối nhỏ (<5 row) vào chunk trước
-      if (chunks.length > 1) {
-        const lastChunk = chunks[chunks.length - 1];
-        const lastChunkSize = lastChunk.endRow - lastChunk.startRow + 1;
-        if (lastChunkSize < 9) {
-          chunks[chunks.length - 2].endRow = lastChunk.endRow;
-          chunks.pop();
-          console.log(`⚡ Gộp chunk cuối nhỏ (${lastChunkSize} row) vào chunk trước`);
-        }
-      }
+  if (!k6) {
+    console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`);
+    continue;
+  }
+
+  const captionText = `${f5}    ${j5}    ${k5}`;
+
+  // === tìm last row theo col K ===
+  const colRes = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${sheetName}!K1:K2000`
+  });
+
+  const colVals = colRes.data.values || [];
+  let lastRow = 1;
+  for (let i = colVals.length - 1; i >= 0; i--) {
+    if (colVals[i]?.[0]) { lastRow = i + 1; break; }
+  }
+
+  console.log('Last row detected (col K):', lastRow);
+
+  // === build chunks ===
+  let chunks = [];
+  let startRow = 1;
+  while (startRow <= lastRow) {
+    const endRow = Math.min(startRow + MAX_ROWS_PER_FILE - 1, lastRow);
+    chunks.push({ startRow, endRow });
+    startRow = endRow + 1;
+  }
+
+  // === Gộp chunk cuối nhỏ (< 9 row) ===
+  if (chunks.length > 1) {
+    const lastChunk = chunks[chunks.length - 1];
+    const lastChunkSize = lastChunk.endRow - lastChunk.startRow + 1;
+
+    if (lastChunkSize < 9) {
+      chunks[chunks.length - 2].endRow = lastChunk.endRow;
+      chunks.pop();
+      console.log(`⚡ Gộp chunk cuối nhỏ (${lastChunkSize} row) vào chunk trước`);
+    }
+  }
+}
 
       // --- convert PDF → PNG song song với pLimit + delay chunk nhỏ ---
       const albumImages = [];
