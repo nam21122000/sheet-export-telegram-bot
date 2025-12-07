@@ -90,13 +90,45 @@ async function main() {
 for (const sheetName of SHEET_NAMES) {
   console.log('--- Processing sheet:', sheetName);
 
-  // (các phần lấy sheetInfo, F5:K6, last row, chunks...)
+  // === TÌM sheetInfo + gid ===
+  const sheetInfo = allSheets.find(s => s.properties?.title === sheetName);
+  if (!sheetInfo) {
+    console.log(`❌ Sheet ${sheetName} not found — skipping`);
+    continue;
+  }
+  const gid = sheetInfo.properties.sheetId;
+
+  // === LẤY LAST ROW (tìm dòng cuối tại cột START_COL) ===
+  const lastRange = `${sheetName}!${START_COL}:${START_COL}`;
+  const lastResp = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: lastRange
+  });
+
+  const rows = lastResp.data.values || [];
+  let lastRow = rows.length;
+  if (lastRow < 2) {
+    console.log(`⚠️ Sheet ${sheetName} rỗng — skip`);
+    continue;
+  }
+
+  console.log(`📌 Last row detected: ${lastRow}`);
+
+  // === TẠO CHUNKS ===
+  const chunks = [];
+  for (let start = 2; start <= lastRow; start += MAX_ROWS_PER_FILE) {
+    const end = Math.min(start + MAX_ROWS_PER_FILE - 1, lastRow);
+    chunks.push({ startRow: start, endRow: end });
+  }
+
+  console.log(`📦 Total chunks: ${chunks.length}`);
 
   // ============================
   // PHẢI ĐƯA VÀO TRONG VÒNG FOR
   // ============================
   const albumImages = [];
 
+  // === PROCESS CHUNKS ===
   for (const chunk of chunks) {
     const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
     const exportUrl =
@@ -125,15 +157,17 @@ for (const sheetName of SHEET_NAMES) {
     albumImages.push({ path: pngPath, fileName: path.basename(pngPath) });
   }
 
-  // --- SEND ALBUM ---
+  // === SEND TELEGRAM ALBUM ===
   console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
   const formAlbum = new FormData();
   formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
 
-  const media = albumImages.map((img, index) => ({
+  const captionText = `${sheetName} — ${albumImages.length} ảnh`;
+
+  const media = albumImages.map((img, i) => ({
     type: 'photo',
     media: `attach://${img.fileName}`,
-    caption: index === 0 ? captionText : undefined
+    caption: i === 0 ? captionText : undefined
   }));
 
   formAlbum.append('media', JSON.stringify(media));
@@ -146,13 +180,14 @@ for (const sheetName of SHEET_NAMES) {
   );
   console.log('📸 Album result:', tgResp.data);
 
-  // cleanup files
+  // cleanup
   albumImages.forEach(img => {
     try { fs.unlinkSync(img.path); } catch {}
     const pdfPath = path.join(tmpDir, img.fileName.replace('.png', '.pdf'));
     try { fs.unlinkSync(pdfPath); } catch {}
   });
 }
+
 
     // --- Cleanup tmpDir chung ---
     fs.rmSync(tmpDir, { recursive: true, force: true });
