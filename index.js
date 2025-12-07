@@ -32,7 +32,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
 // Convert PDF → PNG + trim khoảng trắng
 function convertPdfToPng(pdfPath, outPrefix) {
   return new Promise((resolve, reject) => {
-    execFile('pdftoppm', ['-png', '-singlefile', '-r', '180', pdfPath, outPrefix], async (err) => {
+    execFile('pdftoppm', ['-png', '-singlefile', '-r', '150', pdfPath, outPrefix], async (err) => {
       if (err) return reject(err);
       const pngPath = outPrefix + '.png';
       if (!fs.existsSync(pngPath)) return reject(new Error('PNG conversion failed'));
