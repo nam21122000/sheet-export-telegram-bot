@@ -166,9 +166,9 @@ for (const chunk of chunks) {
 }
 
 
-      const results = await Promise.all(promises);
-      results.sort((a,b) => a.startRow - b.startRow);
-      albumImages.push(...results);
+      //const results = await Promise.all(promises);
+      //results.sort((a,b) => a.startRow - b.startRow);
+      //albumImages.push(...results);
 
       // --- SEND ALBUM ---
       console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
