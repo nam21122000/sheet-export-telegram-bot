@@ -118,7 +118,7 @@ async function main() {
       }
       console.log('Last row detected (col K):', lastRow);
 
-      // --- build array chunks ---
+      // --- build array chunks + gộp chunk cuối nhỏ ---
       let chunks = [];
       let startRow = 1;
       while (startRow <= lastRow) {
@@ -127,7 +127,18 @@ async function main() {
         startRow = endRow + 1;
       }
 
-      // --- convert PDF → PNG song song với pLimit ---
+      // gộp chunk cuối nhỏ (<5 row) vào chunk trước
+      if (chunks.length > 1) {
+        const lastChunk = chunks[chunks.length - 1];
+        const lastChunkSize = lastChunk.endRow - lastChunk.startRow + 1;
+        if (lastChunkSize < 9) {
+          chunks[chunks.length - 2].endRow = lastChunk.endRow;
+          chunks.pop();
+          console.log(`⚡ Gộp chunk cuối nhỏ (${lastChunkSize} row) vào chunk trước`);
+        }
+      }
+
+      // --- convert PDF → PNG song song với pLimit + delay chunk nhỏ ---
       const albumImages = [];
       const promises = chunks.map(chunk => limit(async () => {
         const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
@@ -139,9 +150,6 @@ async function main() {
         console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
         const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
 
-        // delay nhỏ giữa các request Google
-        await new Promise(r => setTimeout(r, 200));
-
         const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
         const pdfPath = path.join(tmpDir, pdfName);
         fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
@@ -149,8 +157,13 @@ async function main() {
         const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
         const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-        // Delay nhẹ chống Telegram rate limit
-        await new Promise(r => setTimeout(r, 500));
+        // --- delay tăng dần cho chunk nhỏ để giảm 429 ---
+        const chunkSize = chunk.endRow - chunk.startRow + 1;
+        if (chunkSize < MAX_ROWS_PER_FILE) {
+          const extraDelay = 500 + (MAX_ROWS_PER_FILE - chunkSize) * 100;
+          console.log(`⏱ Delay thêm ${extraDelay}ms cho chunk nhỏ (${chunkSize} row)`);
+          await new Promise(r => setTimeout(r, extraDelay));
+        }
 
         return { path: pngPath, fileName: path.basename(pngPath), startRow: chunk.startRow };
       }));
