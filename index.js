@@ -19,7 +19,6 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
     });
   } catch (err) {
     if (err.response && err.response.status === 429 && attempt < 5) {
-      // delay random 3–6s
       const delay = 3000 + Math.floor(Math.random() * 3000);
       console.log(`⚠️ Google 429 — retry ${attempt}/5 after ${delay}ms`);
       await new Promise(r => setTimeout(r, delay));
@@ -29,7 +28,7 @@ async function fetchPdfWithRetry(url, headers, attempt = 1) {
   }
 }
 
-// Convert PDF → PNG + trim khoảng trắng
+// Convert PDF → PNG + trim
 function convertPdfToPng(pdfPath, outPrefix) {
   return new Promise((resolve, reject) => {
     execFile('pdftoppm', ['-png', '-singlefile', '-r', '150', pdfPath, outPrefix], async (err) => {
@@ -81,119 +80,138 @@ async function main() {
 
     const sheetsApi = google.sheets({ version: 'v4', auth: jwtClient });
 
-    // === tmpDir chung ===
+    // === TMP DIR ===
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sheetpdf-'));
 
-    const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-    const allSheets = meta.data.sheets || [];
+    // ============================
+    //   ✅ GỌI METADATA 1 LẦN
+    // ============================
+    const metadata = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+    const allSheets = metadata.data.sheets || [];
+    console.log(`📄 Loaded metadata for ${allSheets.length} sheets`);
 
-for (const sheetName of SHEET_NAMES) {
-  console.log('--- Processing sheet:', sheetName);
+    // ============================
+    //   XỬ LÝ TỪNG SHEET
+    // ============================
+    for (const sheetName of SHEET_NAMES) {
+      console.log('--- Processing sheet:', sheetName);
 
-  // === TÌM sheetInfo + gid ===
-  const sheetInfo = allSheets.find(s => s.properties?.title === sheetName);
-  if (!sheetInfo) {
-    console.log(`❌ Sheet ${sheetName} not found — skipping`);
-    continue;
-  }
-  const gid = sheetInfo.properties.sheetId;
+      // tìm sheetInfo từ metadata đã cache
+      const sheetInfo = allSheets.find(s => s.properties?.title === sheetName);
+      if (!sheetInfo) { console.log(`⚠️ Sheet "${sheetName}" not found — skipping`); continue; }
+      const gid = sheetInfo.properties.sheetId;
 
-  // === LẤY LAST ROW (tìm dòng cuối tại cột START_COL) ===
-  const lastRange = `${sheetName}!${START_COL}:${START_COL}`;
-  const lastResp = await sheetsApi.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: lastRange
-  });
+      // Lấy F5:K6
+      const rangeRes = await sheetsApi.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${sheetName}!F5:K6`
+      });
+      const values = rangeRes.data.values || [];
+      const f5 = values[0]?.[0] || '';
+      const j5 = values[0]?.[4] || '';
+      const k5 = values[0]?.[5] || '';
+      const k6 = values[1]?.[5] || '';
+      if (!k6) { console.log(`⚠️ Sheet "${sheetName}" K6 trống — bỏ qua`); continue; }
+      const captionText = `${f5}    ${j5}    ${k5}`;
 
-  const rows = lastResp.data.values || [];
-  let lastRow = rows.length;
-  if (lastRow < 2) {
-    console.log(`⚠️ Sheet ${sheetName} rỗng — skip`);
-    continue;
-  }
+      // Last row col K
+      const colRes = await sheetsApi.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${sheetName}!K1:K2000`
+      });
+      const colVals = colRes.data.values || [];
+      let lastRow = 1;
+      for (let i = colVals.length - 1; i >= 0; i--) {
+        if (colVals[i]?.[0]) { lastRow = i + 1; break; }
+      }
+      console.log('Last row detected (col K):', lastRow);
 
-  console.log(`📌 Last row detected: ${lastRow}`);
+      // build chunks
+      let chunks = [];
+      let startRow = 1;
+      while (startRow <= lastRow) {
+        const endRow = Math.min(startRow + MAX_ROWS_PER_FILE - 1, lastRow);
+        chunks.push({ startRow, endRow });
+        startRow = endRow + 1;
+      }
+      if (chunks.length > 1) {
+        const lastChunk = chunks[chunks.length - 1];
+        const sz = lastChunk.endRow - lastChunk.startRow + 1;
+        if (sz < 9) {
+          chunks[chunks.length - 2].endRow = lastChunk.endRow;
+          chunks.pop();
+          console.log(`⚡ Gộp chunk cuối nhỏ (${sz} rows)`);
+        }
+      }
 
-  // === TẠO CHUNKS ===
-  const chunks = [];
-  for (let start = 2; start <= lastRow; start += MAX_ROWS_PER_FILE) {
-    const end = Math.min(start + MAX_ROWS_PER_FILE - 1, lastRow);
-    chunks.push({ startRow: start, endRow: end });
-  }
+      // Export từng chunk
+      const albumImages = [];
 
-  console.log(`📦 Total chunks: ${chunks.length}`);
+      for (const chunk of chunks) {
+        const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
+        const exportUrl =
+          `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
+          `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
+          `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
 
-  // ============================
-  // PHẢI ĐƯA VÀO TRONG VÒNG FOR
-  // ============================
-  const albumImages = [];
+        console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
+        const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
 
-  // === PROCESS CHUNKS ===
-  for (const chunk of chunks) {
-    const rangeParam = `${sheetName}!${START_COL}${chunk.startRow}:${END_COL}${chunk.endRow}`;
-    const exportUrl =
-      `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=pdf` +
-      `&portrait=false&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false` +
-      `&gridlines=false&fzr=false&gid=${gid}&range=${encodeURIComponent(rangeParam)}`;
+        const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
+        const pdfPath = path.join(tmpDir, pdfName);
+        fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
 
-    console.log(`➡ Export PDF for ${sheetName} rows ${chunk.startRow}-${chunk.endRow}`);
-    const pdfResp = await fetchPdfWithRetry(exportUrl, { Authorization: `Bearer ${accessToken}` });
+        const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
+        const pngPath = await convertPdfToPng(pdfPath, outPrefix);
 
-    const pdfName = `${sheetName}_${chunk.startRow}-${chunk.endRow}.pdf`;
-    const pdfPath = path.join(tmpDir, pdfName);
-    fs.writeFileSync(pdfPath, Buffer.from(pdfResp.data));
+        // Delay chunk nhỏ
+        const sz = chunk.endRow - chunk.startRow + 1;
+        if (sz < MAX_ROWS_PER_FILE) {
+          const extra = 500 + (MAX_ROWS_PER_FILE - sz) * 100;
+          console.log(`⏱ Delay thêm ${extra}ms cho chunk nhỏ (${sz} rows)`);
+          await new Promise(r => setTimeout(r, extra));
+        }
 
-    const outPrefix = path.join(tmpDir, path.basename(pdfName, '.pdf'));
-    const pngPath = await convertPdfToPng(pdfPath, outPrefix);
+        albumImages.push({
+          path: pngPath,
+          fileName: path.basename(pngPath)
+        });
+      }
 
-    // delay chunk nhỏ
-    const chunkSize = chunk.endRow - chunk.startRow + 1;
-    if (chunkSize < MAX_ROWS_PER_FILE) {
-      const extraDelay = 500 + (MAX_ROWS_PER_FILE - chunkSize) * 100;
-      console.log(`⏱ Delay thêm ${extraDelay}ms cho chunk nhỏ (${chunkSize} row)`);
-      await new Promise(r => setTimeout(r, extraDelay));
+      // SEND ALBUM
+      console.log(`📤 Sending ALBUM for sheet ${sheetName}`);
+      const formAlbum = new FormData();
+      formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
+
+      const media = albumImages.map((img, i) => ({
+        type: "photo",
+        media: `attach://${img.fileName}`,
+        caption: i === 0 ? captionText : undefined
+      }));
+      formAlbum.append('media', JSON.stringify(media));
+      albumImages.forEach(img => formAlbum.append(img.fileName, fs.createReadStream(img.path)));
+
+      const tgResp = await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
+        formAlbum,
+        { headers: formAlbum.getHeaders() }
+      );
+      console.log('📸 Album result:', tgResp.data);
+
+      // Cleanup
+      albumImages.forEach(img => {
+        try { fs.unlinkSync(img.path); } catch {}
+        try {
+          const pdfPath = path.join(tmpDir, img.fileName.replace('.png', '.pdf'));
+          fs.unlinkSync(pdfPath);
+        } catch {}
+      });
     }
 
-    albumImages.push({ path: pngPath, fileName: path.basename(pngPath) });
-  }
-
-  // === SEND TELEGRAM ALBUM ===
-  console.log(`📤 Sending ALBUM for sheet ${sheetName} with ${albumImages.length} images`);
-  const formAlbum = new FormData();
-  formAlbum.append('chat_id', TELEGRAM_CHAT_ID);
-
-  const captionText = `${sheetName} — ${albumImages.length} ảnh`;
-
-  const media = albumImages.map((img, i) => ({
-    type: 'photo',
-    media: `attach://${img.fileName}`,
-    caption: i === 0 ? captionText : undefined
-  }));
-
-  formAlbum.append('media', JSON.stringify(media));
-  albumImages.forEach(img => formAlbum.append(img.fileName, fs.createReadStream(img.path)));
-
-  const tgResp = await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
-    formAlbum,
-    { headers: formAlbum.getHeaders() }
-  );
-  console.log('📸 Album result:', tgResp.data);
-
-  // cleanup
-  albumImages.forEach(img => {
-    try { fs.unlinkSync(img.path); } catch {}
-    const pdfPath = path.join(tmpDir, img.fileName.replace('.png', '.pdf'));
-    try { fs.unlinkSync(pdfPath); } catch {}
-  });
-}
-
-
-    // --- Cleanup tmpDir chung ---
+    // Cleanup temp folder
     fs.rmSync(tmpDir, { recursive: true, force: true });
     console.log('🎉 All sheets processed successfully');
-
-  } catch(err) {
+  } catch (err) {
     console.error('ERROR:', err?.message || err);
     process.exit(1);
   }
