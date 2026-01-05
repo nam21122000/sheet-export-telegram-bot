@@ -125,7 +125,15 @@ async function main() {
         if (colVals[i]?.[0]) { lastRow = i + 1; break; }
       }
       console.log('Last row detected (col K):', lastRow);
-
+      
+      // =================================================
+      // ✅ ÉP EXPORT ĐỦ 15 DÒNG NẾU DỮ LIỆU <= 15
+      // =================================================
+      if (lastRow <= 15) {
+        console.log(`📏 Sheet có ${lastRow} dòng → ép export đủ 15 dòng`);
+        lastRow = 15;
+      }
+      
       // build chunks
       let chunks = [];
       let startRow = 1;
